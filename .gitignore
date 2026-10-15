@@ -1,14 +1,1 @@
-.venv/
-__pycache__/
-*.pyc
-data/
-models*/
-*.db
-*.pkl
-.pytest_cache/
 
-rba-dataset.csv
-
-rba-dataset.csv
-
-rba-dataset.csv
