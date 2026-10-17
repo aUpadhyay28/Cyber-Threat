@@ -31,6 +31,11 @@ WARM_MIN_HISTORY = 3           # takeover head needs >= 3 prior trusted logins b
 # memorise the past; the attack-IP head therefore does not use them.
 ALLTIME_FEATURES = ["ip_distinct_users_log", "asn_distinct_users_log", "history_count_log",
                     "user_fail_prior_log", "browser_global_freq", "os_global_freq"]
+# Excluded from the IP/network head (still computed, so you can switch them back on for your own data):
+#  * log_rtt     - round-trip time is randomly assigned in the RBA data and mostly missing; "RTT present" was
+#                  being used as a signal, which is a dataset artifact
+#  * ip_n_1h_log - 1-hour count: no signal on this data (ablation) and the model fit it backwards
+IP_HEAD_EXCLUDE = ALLTIME_FEATURES + ["log_rtt", "ip_n_1h_log"]
 # Takeover head: deviation of THIS login from THIS user's own history ('success' is excluded: a takeover is
 # a successful login by definition, so it would be a label artifact).
 DEV_FEATURES = ["new_country", "new_asn", "new_ip", "new_device", "new_browser", "new_os",

@@ -49,3 +49,29 @@ def event_to_row(ev: dict) -> dict:
     """One live login event (dict keyed by RAW_COLUMNS values) -> prepared row (python scalars)."""
     p = normalize_chunk(pd.DataFrame([ev]))
     return {k: (v.item() if hasattr(v, "item") else v) for k, v in p.iloc[0].to_dict().items()}
+
+
+def load_prepared(data_dir: str, max_rows: int | None = None) -> pd.DataFrame:
+    """Read the prepared parquet parts into ONE table without holding two copies in memory
+    (pd.concat of a list of parts needs about twice the final size)."""
+    import glob
+    import pyarrow.parquet as pq
+    parts = sorted(glob.glob(f"{data_dir}/part_*.parquet"))
+    if not parts:
+        raise FileNotFoundError(f"No parquet parts in {data_dir} - run scripts/prepare_data.py first")
+    total = sum(pq.ParquetFile(p).metadata.num_rows for p in parts)
+    n = total if max_rows is None else min(total, max_rows)
+    first = pd.read_parquet(parts[0])
+    out = {c: np.empty(n, dtype=first[c].dtype) for c in first.columns}
+    del first
+    pos = 0
+    for p in parts:
+        if pos >= n:
+            break
+        ch = pd.read_parquet(p)
+        m = min(len(ch), n - pos)
+        for c in out:
+            out[c][pos:pos + m] = ch[c].to_numpy()[:m]
+        pos += m
+        del ch
+    return pd.DataFrame(out, copy=False)

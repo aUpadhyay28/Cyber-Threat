@@ -36,12 +36,15 @@ def _dev_pipeline():
     return make_pipeline(StandardScaler(), LogisticRegression(C=0.1, class_weight="balanced", max_iter=2000))
 
 
-def train(df: pd.DataFrame, out_dir: str, feedback_rows: pd.DataFrame | None = None,
+def train(df, out_dir: str, feedback_rows: pd.DataFrame | None = None,
           bulk_threshold: int = C.BULK_USER_THRESHOLD, max_train_rows: int = 4_000_000,
           seed: int = 0, verbose: bool = True) -> dict:
     log = print if verbose else (lambda *a, **k: None)
     t0 = time.time(); rng = np.random.default_rng(seed)
-    df = df.sort_values("ts_ms", kind="stable").reset_index(drop=True)
+    if callable(df):                       # a loader: the only reference to the data lives in this function
+        df = df()
+    if not df["ts_ms"].is_monotonic_increasing:        # the RBA file is already in time order -> no big copy
+        df = df.sort_values("ts_ms", kind="stable").reset_index(drop=True)
     n = len(df)
     log(f"[1/7] building features for {n:,} logins ...")
     X = build_features(df).to_numpy(dtype=np.float32)
@@ -55,7 +58,7 @@ def train(df: pd.DataFrame, out_dir: str, feedback_rows: pd.DataFrame | None = N
 
     # ------------------------------------------------------------------ IP / network head
     log("[2/7] attack-IP head: choosing a SMALL model on the validation period ...")
-    ip_feats = [f for f in FEATURES if f not in C.ALLTIME_FEATURES]; ip_cols = [_F[f] for f in ip_feats]
+    ip_feats = [f for f in FEATURES if f not in C.IP_HEAD_EXCLUDE]; ip_cols = [_F[f] for f in ip_feats]
     tr_rows = np.flatnonzero(~bulk[:a] & ~ato[:a])
     if len(tr_rows) > max_train_rows: tr_rows = np.sort(rng.choice(tr_rows, max_train_rows, replace=False))
     va_rows = np.flatnonzero(~bulk[a:b]) + a
