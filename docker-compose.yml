@@ -1,0 +1,78 @@
+# A runnable multi-worker deployment: the risk service, shared state in Redis, and nothing exposed
+# that should not be.
+#
+#   export RISK_API_KEY="$(python -c 'import secrets;print(secrets.token_urlsafe(32))')"
+#   export RISK_MODEL_SHA256="$(cat models/latest.joblib.sha256)"
+#   docker compose up
+#
+# Two deliberate choices worth noticing:
+#
+#  * the service binds to 127.0.0.1 on the host, not 0.0.0.0. This API must never be reachable from
+#    the internet - it holds the credential-stuffing history for every account, and its responses
+#    tell an attacker exactly which signal fired. Only your login backend calls it.
+#  * models/ is mounted read-only. The model file is a joblib, so whoever can replace it can run
+#    code in this process and decide which logins get blocked.
+services:
+  redis:
+    image: redis:7-alpine
+    # AOF on: the behavioural state is worth keeping across a restart. It is NOT the audit trail
+    # (that is SQLite/Postgres), so losing the last second of it costs accuracy, not records.
+    command: ["redis-server", "--appendonly", "yes", "--save", "900 1"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  risk:
+    build: .
+    # Workers should roughly match available cores. Measured on 2 vCPUs, going 1 -> 2 workers made
+    # p50 latency eight times worse for a ~20% throughput gain. Re-run scripts/loadtest.py after
+    # changing this; the number that matters is p99, because the client timeout has to clear it.
+    command: ["uvicorn", "riskengine.api:create_app", "--factory",
+              "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+    environment:
+      RISK_API_KEY: "${RISK_API_KEY:?set RISK_API_KEY to a long random secret}"
+      RISK_MODEL_SHA256: "${RISK_MODEL_SHA256:-}"
+      RISK_MODEL_PATH: /app/models/latest.joblib
+      RISK_DB_PATH: /data/risk.db
+      RISK_REDIS_URL: redis://redis:6379/0
+      # Server clock, never the caller's: a future-dated login would clear the activity windows an
+      # attacking IP is judged by. See SECURITY.md.
+      RISK_TIMESTAMP_SOURCE: server
+      # Resolve country/ASN from the IP. Without the databases this falls back to trusting the
+      # caller, which makes the home-country policy bypassable - mount them and set this to maxmind.
+      RISK_GEOIP_MODE: "${RISK_GEOIP_MODE:-client}"
+      RISK_GEOIP_COUNTRY_DB: /app/geoip/GeoLite2-Country.mmdb
+      RISK_GEOIP_ASN_DB: /app/geoip/GeoLite2-ASN.mmdb
+      RISK_HOME_COUNTRIES: "${RISK_HOME_COUNTRIES:-}"
+      RISK_LOG_JSON: "1"
+      # Shadow mode by default. Raise enforcement deliberately, after retraining on your own
+      # traffic - see PRODUCTION.md stage 1.
+      RISK_WARMUP_MIN_EVENTS: "${RISK_WARMUP_MIN_EVENTS:-1000000}"
+    volumes:
+      - ./models:/app/models:ro
+      - ./geoip:/app/geoip:ro
+      - risk-data:/data
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # /ready, not /health: readiness is false while the model loads and during shutdown, so a
+      # rolling deploy does not send logins to a worker that has no model yet.
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/ready',timeout=2).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  risk-data:

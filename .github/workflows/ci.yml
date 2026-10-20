@@ -1,0 +1,44 @@
+name: tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Tests
+        run: pytest -q
+
+      - name: Smoke-test the pipeline end to end
+        run: |
+          python scripts/make_mock_data.py --out mock.csv --n 60000
+          python scripts/prepare_data.py --csv mock.csv --out prepared
+          python scripts/train.py --data prepared --out models
+          python scripts/pin_model.py --model models/latest.joblib
+          python -c "
+          from riskengine.modeling import RiskModel
+          from riskengine.persist import verify_model
+          verify_model('models/latest.joblib')
+          m = RiskModel.load('models/latest.joblib')
+          print('model', m.meta['version'], 'ok;', len(m.meta['features']), 'features')
+          "

@@ -1,0 +1,23 @@
+# Upper bounds, not exact pins: the project must keep working as you upgrade, but a new major
+# version of pandas or scikit-learn should be a deliberate step, not something a fresh `pip install`
+# does to you between a demo and an interview. The lower bounds are the versions this code needs;
+# the suite is run against the newest release allowed here in CI.
+pandas>=2.0,<4
+numpy>=1.24,<3
+scikit-learn>=1.3,<2
+pyarrow>=14,<27
+joblib>=1.3,<2
+fastapi>=0.110,<1
+uvicorn>=0.27,<1
+pydantic>=2.0,<3
+httpx>=0.26,<1
+pytest>=8.0,<10
+# Server-side geo-IP (riskengine/geoip.py). Imported lazily, so the project runs without it as long
+# as RISK_GEOIP_MODE stays "client" - but that means the caller chooses its own country, so install
+# it and use "maxmind" anywhere real.
+geoip2>=4.7,<6
+# Shared state across workers (riskengine/redis_state.py). Optional: without RISK_REDIS_URL the
+# service keeps its state in-process, which is correct for a single worker.
+redis>=5.0,<7
+# Prometheus /metrics. Optional: without it /metrics returns a note and the counters are no-ops.
+prometheus_client>=0.20,<1

@@ -1,0 +1,519 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Login risk review</title>
+<!--
+  Analyst triage console, served by riskengine/api.py at /console.
+
+  Design notes, so the next person does not "tidy" them away:
+
+  * The score is a PERCENTILE among normal logins, not a quantity, so it is drawn as a position on
+    a scale with the Medium (98) and High (99.5) thresholds marked. "98.7" tells an analyst much
+    less than seeing it sit just past the Medium line.
+  * Model and policy are coloured differently and reported separately, because "the model flagged
+    this" and "a rule flagged this" need completely different responses from a reviewer.
+  * No webfont and no external requests at all: a security console has to work airgapped, and it
+    should not tell Google who is reviewing logins.
+  * Keyboard first. Triage is repetitive; j/k to move and b/s/m to judge is how this work is
+    actually done. Buttons exist for discoverability, not as the main path.
+  * Everything an attacker controls - user agent, browser, OS strings - is rendered with
+    textContent, never innerHTML. These fields are hostile input and they are also the obvious
+    injection channel if an LLM is ever pointed at this queue.
+-->
+<style>
+  :root {
+    --paper:   #eef1f4;
+    --surface: #fbfcfd;
+    --ink:     #1b2430;
+    --ink-soft:#5a6672;
+    --rule:    #c9d1d9;
+    --low:     #2e7d57;
+    --medium:  #b5751a;
+    --high:    #a32b2b;
+    --policy:  #4b5eaa;
+    --focus:   #1b2430;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper:   #121820;
+      --surface: #1a222c;
+      --ink:     #e6ebf0;
+      --ink-soft:#9aa7b4;
+      --rule:    #33414f;
+      --low:     #5cb98c;
+      --medium:  #d9a04a;
+      --high:    #e0706b;
+      --policy:  #8c9ce0;
+      --focus:   #e6ebf0;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
+
+  /* ---------- status bar: the facts that silently invalidate everything else ---------- */
+  header {
+    display: flex; flex-wrap: wrap; gap: 0 28px; align-items: baseline;
+    padding: 10px 20px; border-bottom: 1px solid var(--rule); background: var(--surface);
+  }
+  header h1 { font-size: 15px; font-weight: 650; margin: 0 20px 0 0; letter-spacing: -0.01em; }
+  .fact { font-size: 12.5px; color: var(--ink-soft); }
+  .fact b { color: var(--ink); font-weight: 600; }
+  /* `.fact b` is a class+element selector, so it outranks a bare `.warn` class and the
+     warnings silently rendered in normal ink. Match the specificity deliberately. */
+  .warn, .fact b.warn { color: var(--high); font-weight: 600; }
+  .spacer { flex: 1 1 auto; }
+
+  /* ---------- two panes ---------- */
+  main { display: grid; grid-template-columns: minmax(300px, 400px) 1fr; height: calc(100% - 43px); }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; height: auto; } }
+
+  #queue { border-right: 1px solid var(--rule); overflow-y: auto; background: var(--surface); }
+  .qhead {
+    display: flex; justify-content: space-between; align-items: baseline;
+    padding: 12px 16px 8px; font-size: 12.5px; color: var(--ink-soft);
+    position: sticky; top: 0; background: var(--surface); border-bottom: 1px solid var(--rule);
+  }
+  .row {
+    display: grid; grid-template-columns: 4px 1fr auto; gap: 0 12px; align-items: center;
+    padding: 10px 16px 10px 0; border-bottom: 1px solid var(--rule);
+    cursor: pointer; width: 100%; background: none; border-left: 0; border-right: 0; border-top: 0;
+    text-align: left; color: inherit; font: inherit;
+  }
+  .row:hover { background: color-mix(in srgb, var(--ink) 4%, transparent); }
+  .row[aria-current="true"] { background: color-mix(in srgb, var(--ink) 8%, transparent); }
+  .row:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+  .bar { width: 4px; height: 34px; }
+  .bar.Medium { background: var(--medium); }
+  .bar.High   { background: var(--high); }
+  .who { font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .when { font-size: 12px; color: var(--ink-soft); }
+  .rowscore { font-size: 13px; font-variant-numeric: tabular-nums; }
+
+  /* ---------- review pane ---------- */
+  #review { overflow-y: auto; padding: 24px 28px 48px; }
+  .userline { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .userline h2 { font-size: 20px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+  .chip {
+    font-size: 12px; padding: 2px 8px; border: 1px solid currentColor; border-radius: 2px;
+  }
+  .chip.Low { color: var(--low); } .chip.Medium { color: var(--medium); } .chip.High { color: var(--high); }
+  .chip.policy { color: var(--policy); }
+
+  /* the threshold ruler: a percentile is a position, so draw it as one */
+  .ruler { margin: 26px 0 10px; }
+  .track { position: relative; height: 40px; border-bottom: 1px solid var(--rule); }
+  .tick { position: absolute; top: 0; bottom: 0; border-left: 1px dashed var(--rule); }
+  .tick span { position: absolute; bottom: -20px; transform: translateX(-50%); font-size: 11.5px; color: var(--ink-soft); white-space: nowrap; }
+  .needle { position: absolute; top: 4px; bottom: 0; width: 2px; background: var(--ink); }
+  .needle b {
+    position: absolute; top: -20px; transform: translateX(-50%);
+    font-size: 13px; font-weight: 650; font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+  /* A saturated score sits on the right edge; pull its label back inside the track. */
+  .needle[data-edge="right"] b { transform: translateX(-100%); }
+  .needle[data-edge="left"]  b { transform: translateX(0); }
+  .ruler { max-width: 760px; }
+  .zone { position: absolute; top: 0; bottom: 0; }
+  .zone.med  { background: color-mix(in srgb, var(--medium) 12%, transparent); }
+  .zone.high { background: color-mix(in srgb, var(--high) 14%, transparent); }
+  .rulercap { margin-top: 26px; font-size: 12.5px; color: var(--ink-soft); max-width: 60ch; }
+
+  h3 { font-size: 13px; font-weight: 650; margin: 28px 0 8px; }
+  ul.reasons { margin: 0; padding-left: 18px; max-width: 70ch; }
+  ul.reasons li { margin-bottom: 4px; }
+  ul.reasons li.policy { color: var(--policy); }
+
+  table { border-collapse: collapse; font-size: 13px; }
+  table td { padding: 3px 18px 3px 0; vertical-align: top; }
+  table td:first-child { color: var(--ink-soft); white-space: nowrap; }
+
+  /* ---------- verdict actions ---------- */
+  .actions { display: flex; gap: 10px; flex-wrap: wrap; margin: 28px 0 0; padding-top: 20px; border-top: 1px solid var(--rule); }
+  button.verdict {
+    font: inherit; font-size: 14px; padding: 9px 16px; background: var(--surface);
+    border: 1px solid var(--rule); border-radius: 2px; color: var(--ink); cursor: pointer;
+  }
+  button.verdict:hover { border-color: var(--ink); }
+  button.verdict:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  button.verdict kbd {
+    font-family: ui-monospace, monospace; font-size: 11px; color: var(--ink-soft);
+    border: 1px solid var(--rule); border-radius: 2px; padding: 0 4px; margin-left: 8px;
+  }
+  button.verdict.benign:hover  { border-color: var(--low); }
+  button.verdict.malicious:hover { border-color: var(--high); }
+  .note { margin-top: 14px; }
+  .note input {
+    font: inherit; font-size: 13px; width: 100%; max-width: 52ch; padding: 7px 9px;
+    border: 1px solid var(--rule); border-radius: 2px; background: var(--surface); color: var(--ink);
+  }
+
+  /* ---------- empty / gate states: an empty screen is an invitation to act ---------- */
+  .pad { padding: 48px 28px; max-width: 62ch; }
+  .pad p { color: var(--ink-soft); }
+  .gate label { display: block; font-size: 13px; margin-bottom: 6px; }
+  .gate input {
+    font: inherit; width: 100%; max-width: 46ch; padding: 9px 11px; border: 1px solid var(--rule);
+    border-radius: 2px; background: var(--surface); color: var(--ink);
+  }
+  .gate button {
+    font: inherit; margin-top: 12px; padding: 9px 18px; border: 1px solid var(--ink);
+    border-radius: 2px; background: var(--ink); color: var(--paper); cursor: pointer;
+  }
+  .err { color: var(--high); margin-top: 10px; font-size: 13px; }
+
+  /* one deliberate motion: a judged row leaves the queue, so the change is visible */
+  .row.resolved { animation: collapse .22s ease forwards; overflow: hidden; }
+  @keyframes collapse { to { height: 0; padding-top: 0; padding-bottom: 0; opacity: 0; border-width: 0; } }
+  @media (prefers-reduced-motion: reduce) { .row.resolved { animation: none; display: none; } }
+</style>
+</head>
+<body>
+
+<div id="gate" class="pad gate" hidden>
+  <h1 style="font-size:18px;margin:0 0 6px">Login risk review</h1>
+  <p>This console talks to the risk service on this host. Paste the service's API key to start
+     reviewing. It stays in this browser tab and is never written to disk.</p>
+  <label for="key">API key</label>
+  <input id="key" type="password" autocomplete="off" spellcheck="false">
+  <button id="unlock">Start reviewing</button>
+  <div id="gateErr" class="err" hidden></div>
+</div>
+
+<div id="app" hidden style="height:100%">
+  <header>
+    <h1>Login risk review</h1>
+    <span class="fact">model <b id="fModel" class="mono">—</b></span>
+    <span class="fact">flagged <b id="fFlag">—</b> of last 24h</span>
+    <span class="fact">waiting <b id="fPending">—</b></span>
+    <span class="fact" id="fWarm"></span>
+    <span class="fact" id="fGeo"></span>
+    <span class="spacer"></span>
+    <span class="fact"><b id="fHome"></b></span>
+  </header>
+
+  <main>
+    <section id="queue" aria-label="Review queue">
+      <div class="qhead">
+        <span>Highest risk first</span>
+        <span id="qCount"></span>
+      </div>
+      <div id="rows"></div>
+      <div id="qEmpty" class="pad" hidden>
+        <h3 style="margin-top:0">Nothing is waiting</h3>
+        <p>No login has been flagged Medium or High and left unreviewed. Either traffic is quiet, or
+           the service is still warming up and only logging its decisions.</p>
+      </div>
+    </section>
+
+    <section id="review" aria-live="polite">
+      <div id="rEmpty" class="pad">
+        <h3 style="margin-top:0">Pick a login to review</h3>
+        <p>Use <b>j</b> and <b>k</b> to move through the queue, then <b>b</b>, <b>s</b> or <b>m</b>
+           to record a verdict. Only benign and confirmed-malicious calls train the next model;
+           suspicious parks the event without teaching anything.</p>
+      </div>
+      <div id="rBody" hidden></div>
+    </section>
+  </main>
+</div>
+
+<script>
+"use strict";
+// ---------------------------------------------------------------- state
+const S = { key: "", queue: [], i: -1, cfg: {}, busy: false };
+const $ = (id) => document.getElementById(id);
+
+function api(path, opts = {}) {
+  return fetch(path, {
+    ...opts,
+    headers: { "X-API-Key": S.key, "Content-Type": "application/json", ...(opts.headers || {}) },
+  }).then(async (r) => {
+    if (!r.ok) throw new Error(`${r.status} ${(await r.text()).slice(0, 200)}`);
+    return r.json();
+  });
+}
+
+// ---------------------------------------------------------------- gate
+try { S.key = sessionStorage.getItem("riskKey") || ""; } catch (e) { S.key = ""; }
+
+function showGate(msg) {
+  $("app").hidden = true; $("gate").hidden = false;
+  if (msg) { $("gateErr").textContent = msg; $("gateErr").hidden = false; }
+  $("key").focus();
+}
+$("unlock").addEventListener("click", () => {
+  S.key = $("key").value.trim();
+  if (!S.key) return showGate("Enter the key the service was started with.");
+  try { sessionStorage.setItem("riskKey", S.key); } catch (e) { /* private window: keep in memory */ }
+  start();
+});
+$("key").addEventListener("keydown", (e) => { if (e.key === "Enter") $("unlock").click(); });
+
+// ---------------------------------------------------------------- load
+async function start() {
+  try {
+    await refresh();
+    $("gate").hidden = true; $("app").hidden = false;
+  } catch (err) {
+    showGate(String(err.message).startsWith("401")
+      ? "That key was rejected by the service."
+      : `Could not reach the risk service: ${err.message}`);
+  }
+}
+
+async function refresh() {
+  const [stats, queue] = await Promise.all([api("/v1/stats?hours=24"), api("/v1/queue?limit=200")]);
+  S.cfg = stats.service || {};
+  S.queue = queue;
+  paintHeader(stats);
+  paintQueue();
+  if (S.i >= S.queue.length) S.i = S.queue.length - 1;
+  if (S.i >= 0) select(S.i); else { $("rBody").hidden = true; $("rEmpty").hidden = false; }
+}
+
+function paintHeader(stats) {
+  const c = S.cfg;
+  $("fModel").textContent = c.model_version || "unknown";
+  const mp = stats.flag_rate_pct.medium_plus;
+  const budget = c.budget_medium_pct;
+  $("fFlag").textContent = `${mp}%`;
+  $("fFlag").className = (budget && mp > budget * 3) ? "warn" : "";
+  $("fFlag").title = `budget ${budget}%`;
+  $("fPending").textContent = stats.queue_pending;
+  $("fWarm").innerHTML = "";
+  if (c.warming_up) {
+    const s = document.createElement("b"); s.className = "warn";
+    s.textContent = "warming up — decisions are logged, not enforced";
+    $("fWarm").appendChild(s);
+  }
+  $("fGeo").innerHTML = "";
+  if (c.geoip_source !== "maxmind") {
+    const s = document.createElement("b"); s.className = "warn";
+    s.textContent = "country comes from the caller";
+    s.title = "Set RISK_GEOIP_MODE=maxmind so the country is resolved from the IP instead.";
+    $("fGeo").appendChild(s);
+  }
+  $("fHome").textContent = (c.home_countries || []).length ? `home ${c.home_countries.join(", ")}` : "";
+}
+
+function fmtWhen(iso) {
+  const d = new Date(iso.endsWith("Z") || iso.includes("+") ? iso : iso + "Z");
+  const mins = Math.round((Date.now() - d.getTime()) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} min ago`;
+  if (mins < 60 * 36) return `${Math.round(mins / 60)} h ago`;
+  return d.toLocaleDateString();
+}
+
+function paintQueue() {
+  const host = $("rows");
+  host.textContent = "";
+  $("qEmpty").hidden = S.queue.length > 0;
+  $("qCount").textContent = S.queue.length ? `${S.queue.length}` : "";
+  S.queue.forEach((e, idx) => {
+    const b = document.createElement("button");
+    b.className = "row"; b.type = "button"; b.dataset.id = e.event_id;
+    const bar = document.createElement("span"); bar.className = `bar ${e.tier}`;
+    const mid = document.createElement("span");
+    const who = document.createElement("div"); who.className = "who";
+    who.textContent = e.user_id;                       // attacker-controlled: textContent only
+    const when = document.createElement("div"); when.className = "when";
+    when.textContent = `${e.tier} · ${fmtWhen(e.created_at)}`;
+    mid.append(who, when);
+    const sc = document.createElement("span");
+    sc.className = "rowscore mono"; sc.textContent = Number(e.risk).toFixed(1);
+    b.append(bar, mid, sc);
+    b.addEventListener("click", () => select(idx));
+    host.appendChild(b);
+  });
+}
+
+// ---------------------------------------------------------------- review pane
+async function select(idx) {
+  if (idx < 0 || idx >= S.queue.length) return;
+  S.i = idx;
+  [...$("rows").children].forEach((el, k) => el.setAttribute("aria-current", String(k === idx)));
+  $("rows").children[idx]?.scrollIntoView({ block: "nearest" });
+  const summary = S.queue[idx];
+  let detail = null;
+  try { detail = await api(`/v1/event/${encodeURIComponent(summary.event_id)}`); } catch (e) { /* fall back */ }
+  paintReview(summary, detail);
+}
+
+function row(table, label, value) {
+  const tr = document.createElement("tr");
+  const a = document.createElement("td"); a.textContent = label;
+  let shown = "—";
+  if (value === true || value === "True" || value === "true") shown = "yes";
+  else if (value === false || value === "False" || value === "false") shown = "no";
+  else if (value != null && value !== "") shown = String(value);
+  const b = document.createElement("td"); b.textContent = shown;
+  b.className = "mono";
+  tr.append(a, b); table.appendChild(tr);
+}
+
+function paintReview(summary, detail) {
+  const host = $("rBody");
+  host.textContent = "";
+  $("rEmpty").hidden = true; host.hidden = false;
+  const reasons = detail ? detail.reasons : JSON.parse(summary.reasons_json || "[]");
+  const raw = detail ? detail.raw : {};
+  const risk = Number(summary.risk);
+
+  // who
+  const line = document.createElement("div"); line.className = "userline";
+  const h2 = document.createElement("h2"); h2.textContent = summary.user_id;
+  const tier = document.createElement("span"); tier.className = `chip ${summary.tier}`;
+  tier.textContent = summary.tier;
+  line.append(h2, tier);
+  if (detail && detail.model_version) {
+    const v = document.createElement("span"); v.className = "fact mono";
+    v.textContent = detail.model_version; line.appendChild(v);
+  }
+  host.appendChild(line);
+
+  // the ruler
+  const med = S.cfg.medium_threshold ?? 98, high = S.cfg.high_threshold ?? 99.5;
+  const lo = 96, hi = 100;      // the queue only holds Medium+ (>=98), so this is the region
+                                // where a reviewer's judgement actually changes
+  const pos = (v) => `${Math.min(100, Math.max(0, ((v - lo) / (hi - lo)) * 100))}%`;
+  const ruler = document.createElement("div"); ruler.className = "ruler";
+  const track = document.createElement("div"); track.className = "track";
+  const zMed = document.createElement("div"); zMed.className = "zone med";
+  zMed.style.left = pos(med); zMed.style.right = `${100 - parseFloat(pos(high))}%`;
+  const zHigh = document.createElement("div"); zHigh.className = "zone high";
+  zHigh.style.left = pos(high); zHigh.style.right = "0";
+  [[med, `step-up ${med}`], [high, `block ${high}`]].forEach(([v, label]) => {
+    const t = document.createElement("div"); t.className = "tick"; t.style.left = pos(v);
+    const s = document.createElement("span"); s.textContent = label; t.appendChild(s);
+    track.appendChild(t);
+  });
+  const needle = document.createElement("div"); needle.className = "needle"; needle.style.left = pos(risk);
+  const frac = (risk - lo) / (hi - lo);
+  if (frac > 0.93) needle.dataset.edge = "right";
+  else if (frac < 0.07) needle.dataset.edge = "left";
+  const nb = document.createElement("b"); nb.textContent = risk.toFixed(1); needle.appendChild(nb);
+  track.prepend(zMed, zHigh); track.appendChild(needle);
+  ruler.appendChild(track);
+  const cap = document.createElement("div"); cap.className = "rulercap";
+  cap.textContent = risk >= 99.95
+    ? "Risk is this login's percentile among normal logins. This one sits at the very top of the "
+      + "distribution: more unusual than essentially every normal login the model was calibrated on."
+    : `Risk is this login's percentile among normal logins: more unusual than ${risk.toFixed(1)}% `
+      + "of them. Only the top 2% reach step-up.";
+  ruler.appendChild(cap);
+  host.appendChild(ruler);
+
+  // why
+  if (reasons.length) {
+    const h = document.createElement("h3"); h.textContent = "Why it was flagged";
+    const ul = document.createElement("ul"); ul.className = "reasons";
+    reasons.forEach((r) => {
+      const li = document.createElement("li");
+      li.textContent = r;                              // derived from hostile input: textContent
+      if (/home region|has not used/i.test(r)) li.className = "policy";
+      ul.appendChild(li);
+    });
+    host.append(h, ul);
+  }
+
+  // what we know
+  const h4 = document.createElement("h3"); h4.textContent = "The login";
+  const tbl = document.createElement("table");
+  row(tbl, "when", summary.created_at);
+  row(tbl, "ip", raw["IP Address"]);
+  row(tbl, "country", raw["Country"]);
+  row(tbl, "network (ASN)", raw["ASN"]);
+  row(tbl, "device", raw["Device Type"]);
+  row(tbl, "browser", raw["Browser Name and Version"]);
+  row(tbl, "operating system", raw["OS Name and Version"]);
+  row(tbl, "password accepted", raw["Login Successful"]);
+  row(tbl, "event", summary.event_id);
+  host.append(h4, tbl);
+
+  // judgement
+  const acts = document.createElement("div"); acts.className = "actions";
+  [["benign", "Benign", "b", "Trains the next model as a legitimate login"],
+   ["suspicious", "Suspicious", "s", "Parks it — teaches the model nothing"],
+   ["confirmed_malicious", "Malicious", "m", "Trains the next model as an attack"]
+  ].forEach(([verdict, label, key, title]) => {
+    const btn = document.createElement("button");
+    btn.className = `verdict ${verdict === "benign" ? "benign" : verdict === "confirmed_malicious" ? "malicious" : ""}`;
+    btn.type = "button"; btn.title = title; btn.textContent = label;
+    const k = document.createElement("kbd"); k.textContent = key; btn.appendChild(k);
+    btn.addEventListener("click", () => judge(verdict));
+    acts.appendChild(btn);
+  });
+  host.appendChild(acts);
+
+  const note = document.createElement("div"); note.className = "note";
+  const inp = document.createElement("input");
+  inp.id = "noteBox"; inp.placeholder = "Note for the record (optional)"; inp.autocomplete = "off";
+  note.appendChild(inp); host.appendChild(note);
+
+  const who = document.createElement("div"); who.className = "note";
+  const a = document.createElement("input");
+  a.id = "analystBox"; a.placeholder = "Your name — recorded with the verdict"; a.autocomplete = "off";
+  try { a.value = localStorage.getItem("riskAnalyst") || ""; } catch (e) { /* ignore */ }
+  who.appendChild(a); host.appendChild(who);
+}
+
+// ---------------------------------------------------------------- verdicts
+async function judge(verdict) {
+  if (S.busy || S.i < 0) return;
+  const ev = S.queue[S.i];
+  const analyst = ($("analystBox")?.value || "").trim();
+  if (!analyst) {
+    $("analystBox")?.focus();
+    $("analystBox")?.setAttribute("placeholder", "Add your name first — verdicts are attributed");
+    return;
+  }
+  try { localStorage.setItem("riskAnalyst", analyst); } catch (e) { /* ignore */ }
+  S.busy = true;
+  try {
+    await api("/v1/verdict", {
+      method: "POST",
+      body: JSON.stringify({ event_id: ev.event_id, verdict, analyst, note: ($("noteBox")?.value || "").trim() }),
+    });
+    const el = $("rows").children[S.i];
+    if (el) el.classList.add("resolved");
+    setTimeout(async () => { S.busy = false; await refresh(); }, 220);
+  } catch (err) {
+    S.busy = false;
+    alertInline(err.message);
+  }
+}
+
+function alertInline(msg) {
+  const d = document.createElement("div"); d.className = "err"; d.textContent = `Could not record that: ${msg}`;
+  $("rBody").appendChild(d);
+}
+
+// ---------------------------------------------------------------- keyboard
+document.addEventListener("keydown", (e) => {
+  if ($("app").hidden) return;
+  const typing = /^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName || "");
+  if (typing && e.key !== "Escape") return;
+  if (e.key === "j") { select(Math.min(S.i + 1, S.queue.length - 1)); e.preventDefault(); }
+  if (e.key === "k") { select(Math.max(S.i - 1, 0)); e.preventDefault(); }
+  if (e.key === "b") judge("benign");
+  if (e.key === "s") judge("suspicious");
+  if (e.key === "m") judge("confirmed_malicious");
+  if (e.key === "Escape") document.activeElement?.blur();
+});
+
+// ---------------------------------------------------------------- go
+if (S.key) start(); else showGate();
+setInterval(() => { if (!$("app").hidden && !S.busy) refresh().catch(() => {}); }, 20000);
+</script>
+</body>
+</html>

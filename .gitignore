@@ -1,0 +1,42 @@
+# --- environments and caches -----------------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.idea/
+.vscode/
+nohup.out
+
+# --- secrets ------------------------------------------------------------------------------------
+# RISK_API_KEY and friends belong in the environment or a secrets manager, never in the tree.
+.env
+.env.*
+*.key
+*.pem
+
+# --- data and artefacts ---------------------------------------------------------------------
+# The RBA dataset is 8 GB and is not yours to redistribute: it is CC BY 4.0 from Wiefling et al.,
+# so cite it and let people download their own copy. The prepared parquet and the live state are
+# derived from real logins once you deploy, which makes them personal data.
+data/
+!data/.gitkeep
+models*/
+!models/.gitkeep
+*.db
+*.db-wal
+*.db-shm
+*.pkl
+*.parquet
+*.joblib
+*.json.gz
+
+# --- GeoLite2 databases -----------------------------------------------------------------------
+# MaxMind's licence does NOT permit redistributing these files. Keep them out of the repository
+# and tell people to download their own with a free account (see riskengine/geoip.py).
+geoip/*.mmdb
+geoip/*.tar.gz
+# the dataset is never committed, wherever it sits
+*.csv
