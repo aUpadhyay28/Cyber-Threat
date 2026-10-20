@@ -1,3 +1,4 @@
+![tests](https://github.com/aUpadhyay28/Cyber-Threat/actions/workflows/ci.yml/badge.svg)
 # Adaptive Login Risk Engine
 
 Scores every login **Low / Medium / High** and learns from analyst-validated feedback. One codebase for
