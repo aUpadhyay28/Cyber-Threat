@@ -20,4 +20,4 @@ geoip2>=4.7,<6
 # service keeps its state in-process, which is correct for a single worker.
 redis>=5.0,<7
 # Prometheus /metrics. Optional: without it /metrics returns a note and the counters are no-ops.
-prometheus_client>=0.20,<1
+prometheus_client>=0.26.0,<1
