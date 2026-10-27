@@ -18,6 +18,6 @@ pytest>=8.0,<10
 geoip2>=4.7,<6
 # Shared state across workers (riskengine/redis_state.py). Optional: without RISK_REDIS_URL the
 # service keeps its state in-process, which is correct for a single worker.
-redis>=5.0,<7
+redis>=8.1.0,<9
 # Prometheus /metrics. Optional: without it /metrics returns a note and the counters are no-ops.
 prometheus_client>=0.20,<1
