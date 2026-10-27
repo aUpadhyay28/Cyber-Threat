@@ -37,7 +37,11 @@ you are in; check it, do not assume.
 
 - [ ] privacy notice published, lawful basis recorded, retention period decided
 - [ ] GeoLite2 Country + ASN databases installed; `/health` shows `geoip_source: maxmind`
-- [ ] `RISK_API_KEY` from a secrets manager, not a file or a shell history
+- [ ] `RISK_API_KEY`, `RISK_ANALYST_KEY`, `RISK_ADMIN_KEY`, `RISK_HASH_KEY` and `REDIS_PASSWORD` from a secrets
+      manager (or `*_FILE` secret mounts), never a committed file or a shell history; only `RISK_API_KEY`
+      goes to the login backend
+- [ ] a rotation date for each key written down (comma-separate old and new keys during the switch)
+- [ ] `RISK_ENV=production` set: the service then refuses to start if any check below that it can see is missing
 - [ ] the service is unreachable from the internet (only your login backend can call it)
 - [ ] `RISK_TIMESTAMP_SOURCE=server` (the default) — never `client` in production
 - [ ] model pinned: `scripts/pin_model.py`, digest shipped with the release
@@ -71,6 +75,7 @@ cases to produce confidence intervals, and 51 was not enough to beat a one-line 
 ### Stage 2 — retrain on your own data
 
 ```bash
+# RISK_HASH_KEY must be the same value the live service uses: the hashes have to match
 python scripts/import_history.py --csv your_logins.csv --state data/state.json.gz
 python scripts/prepare_data.py --csv your_logins.csv --out data/prepared
 python scripts/train.py --data data/prepared --out models --feedback-db data/risk.db

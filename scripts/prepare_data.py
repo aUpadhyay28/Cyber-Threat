@@ -6,7 +6,7 @@ import argparse
 from pathlib import Path
 import pandas as pd
 from riskengine.config import RAW_COLUMNS
-from riskengine.data import normalize_chunk
+from riskengine.data import normalize_chunk, write_prepared_fingerprint
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--csv", required=True); ap.add_argument("--out", default="data/prepared")
@@ -20,6 +20,7 @@ missing = [v for v in RAW_COLUMNS.values() if v not in head.columns]
 if missing:
     raise SystemExit(f"Columns missing: {missing}\nYour columns: {list(head.columns)}\n-> edit RAW_COLUMNS in riskengine/config.py")
 out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
+write_prepared_fingerprint(out)          # which RISK_HASH_KEY produced these parts
 total = 0
 for i, ch in enumerate(pd.read_csv(a.csv, chunksize=a.chunk, usecols=list(RAW_COLUMNS.values()))):
     if a.max_rows and total >= a.max_rows: break

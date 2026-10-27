@@ -1,7 +1,7 @@
 """Build features on the FULL data, then save a small stratified sample (a few MB) that can be shared
 for model development. Features need the whole history, so we sample AFTER building them.
 Contains only pseudonymised dataset columns (hashed ids, no raw IPs).
-   python scripts/export_sample.py --data data/prepared --out data/sample_for_claude.parquet"""
+   python scripts/export_sample.py --data data/prepared --out data/sample.parquet"""
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import argparse, glob, os
@@ -9,7 +9,7 @@ import numpy as np, pandas as pd
 from riskengine.features import build_features
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--data", default="data/prepared"); ap.add_argument("--out", default="data/sample_for_claude.parquet")
+ap.add_argument("--data", default="data/prepared"); ap.add_argument("--out", default="data/sample.parquet")
 ap.add_argument("--n-ordinary", type=int, default=150_000, help="legit successful logins of ordinary users")
 ap.add_argument("--n-attack", type=int, default=100_000, help="attack-IP logins")
 ap.add_argument("--n-failed", type=int, default=30_000, help="legit failed logins of ordinary users")

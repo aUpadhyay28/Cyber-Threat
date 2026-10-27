@@ -1,12 +1,12 @@
 """Feature-group ablation on the exported sample (non-bulk users, weighted back to the real population).
-   python scripts/ablation.py --sample data/sample_for_claude.parquet"""
+   python scripts/ablation.py --sample data/sample.parquet"""
 import warnings; warnings.filterwarnings("ignore")
 import argparse
 import numpy as np, pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve
 
-ap = argparse.ArgumentParser(); ap.add_argument("--sample", default="data/sample_for_claude.parquet")
+ap = argparse.ArgumentParser(); ap.add_argument("--sample", default="data/sample.parquet")
 ap.add_argument("--include-bulk", action="store_true"); a = ap.parse_args()
 d = pd.read_parquet(a.sample)
 if not a.include_bulk: d = d[~d.is_bulk]

@@ -50,11 +50,61 @@ successful, or the user passed step-up, or an analyst called it benign. Addition
 login can no longer be confirmed: replaying confirmations for failed attempts was a way to teach the
 system that an attacker's country and device were normal.
 
+**Reversible identifier hashes.** User IDs, IPs, devices and browsers are stored as 64-bit SipHash
+values. With pandas' public default key those are deterministic but not secret: anyone holding a
+state file or a database dump could hash every plausible email address or account number and match
+them back. Set `RISK_HASH_KEY` and the hashes are keyed with a secret derived from it. The key's
+fingerprint (never the key) is recorded in the prepared data, the state file and Redis, and a
+mismatch is refused, because scoring under the wrong key would make every returning user look new.
+`RISK_ENV=production` will not start without it. Tests: `tests/test_hashing.py`.
+
+**Misconfiguration.** `RISK_ENV=production` refuses to start without server timestamps, keyed
+hashing, a pinned model and server-side GeoIP, listing every missing item.
+
 **Audit trail.** Every decision records the model version that made it, so "what scored this login?"
 remains answerable after a retrain.
 
+**One key opening everything.** There are three keys for three roles: `RISK_API_KEY` (score and
+confirm - the only one a web server holds), `RISK_ANALYST_KEY` (review queue and verdicts) and
+`RISK_ADMIN_KEY` (erasure, retention, model reload). A leaked login-backend key can no longer read
+queued logins, record verdicts that retrain the model, or erase accounts; a valid key used outside
+its role gets 403 and a log line. Keys can be read from files (`*_FILE`) so they stay out of process
+environments, several keys per role allow rotation without downtime, and production mode requires
+all three to be set and different. Tests: `tests/test_hardening.py`.
+
 **Brute force and abuse.** Fixed-window rate limiting per caller and, separately, per source address
-on authentication failures. API keys must be at least 24 characters. Constant-time key comparison.
+on authentication failures (shared across workers through Redis when it is configured). API keys must
+be at least 24 characters. Every key is compared in constant time, and all of them are checked on
+each request, so timing does not reveal which key or role a guess came close to.
+
+**Reconnaissance.** In production `/docs`, `/redoc` and `/openapi.json` are off and the
+unauthenticated `/health` says only `{"status": "ok"}`. The `Server` header is removed. `/metrics`
+can require a bearer token (`RISK_METRICS_TOKEN`).
+
+**Oversized requests.** Bodies over 64 KB (`RISK_MAX_BODY_BYTES`) are refused with 413 before any
+parsing, and a body without a Content-Length is refused with 411.
+
+**Script injection in the analyst console.** Attacker-controlled strings (user agents, user IDs) are
+written with `textContent`, never as markup. Behind that, the console is served with a
+Content-Security-Policy that allows only its own inline script, by hash: no external scripts, no
+inline event handlers, no requests to other origins, no framing. API responses carry
+`default-src 'none'`.
+
+**Personal data in logs.** Logs are copied to weaker places than the database and are not touched
+by erasure, so user IDs and IPs never appear in them in clear: log lines carry a short keyed tag
+instead (`u:3f9a...`), which still lets you follow one account through the logs.
+
+**Data at rest.** The audit database and the state file are created owner-only (0600) in an
+owner-only directory. Redis requires a password, has `FLUSHALL`, `FLUSHDB`, `CONFIG` and `DEBUG`
+disabled, and has no published port.
+
+**Container.** Non-root user, read-only root filesystem, all Linux capabilities dropped,
+`no-new-privileges`, memory and process limits, service bound to 127.0.0.1 on the host, model
+mounted read-only.
+
+**Supply chain.** CI runs `pip-audit` (known CVEs in dependencies), `bandit` (static analysis) and
+`detect-secrets` (committed keys) on every push and weekly; Dependabot opens update PRs for Python
+packages, GitHub Actions and the base image; the workflow token is read-only.
 
 **Erasure and retention.** `/v1/admin/forget-user` removes an account from the live profiles and
 deletes its events; `/v1/admin/purge-raw` strips raw IPs and user agents from old events while
@@ -63,9 +113,15 @@ been idle past the retention period, which also bounds memory growth.
 
 ## What is NOT defended, and what an attacker would try next
 
-* **A compromised caller.** Anything holding the API key can assert any `user_id` and `success`, and
-  can confirm any Medium event. The key is the whole trust boundary — this service must not be
-  reachable from the internet.
+* **A compromised login backend.** Anything holding `RISK_API_KEY` can assert any `user_id` and
+  `success`, and can confirm any Medium event. Role separation limits it to that, but within it the
+  key is the trust boundary - this service must not be reachable from the internet.
+* **Self-asserted analyst names.** The analyst key proves a request came from the console, not which
+  analyst sent it; the `analyst` field is what the person typed. Put SSO in front of `/console` if
+  verdicts need to be attributable to individuals.
+* **No TLS of its own.** The service speaks plain HTTP and expects to sit on a private network or
+  behind a TLS-terminating proxy. If the login backend reaches it over any network you do not control,
+  terminate TLS in front of it.
 * **Low-and-slow credential stuffing.** One attempt per IP per day produces no window signal at all.
   The 24 h counts are the main detector, so spreading attempts across a large botnet defeats them.
   This is a limitation of the features, not a bug, and is why the takeover head exists.
@@ -77,11 +133,9 @@ been idle past the retention period, which also bounds memory growth.
 * **The per-category tables cannot be enumerated per user.** They are keyed by a non-invertible
   `mix(user, value)`, so erasure needs the values read back from the event log. If you purge raw
   payloads before honouring an erasure request, those rows cannot be found — purge order matters.
-* **Unsalted hashing of identifiers.** `pd.util.hash_array` is deterministic and unkeyed. That is
-  fine for the public RBA dataset, but on real data keyed by email or sequential account IDs the
-  hashes are reversible by enumeration. Use a keyed HMAC before exporting any sample of real logins.
-* **Single-process state.** The rate limiter and the in-memory state are per worker. With several
-  workers you need shared state (Redis) for both to mean what they say.
+* **Per-worker rate limiter.** Behavioural state can be shared through Redis (`RISK_REDIS_URL`), but
+  the request rate limiter is still per worker, so with N workers the effective limit is N times the
+  configured one. Put a rate limit at your reverse proxy as well.
 * **Model inversion.** `explain()` output tells an attacker precisely which signal fired. It is for
   analysts and the audit log; never return it, or the score, to the end user.
 

@@ -1,6 +1,6 @@
 """Train and calibrate from the exported stratified sample instead of the 31 M-row file.
 
-   python scripts/train_from_sample.py --sample data/sample_for_claude.parquet --out models_sample
+   python scripts/train_from_sample.py --sample data/sample.parquet --out models_sample
 
 The sample (scripts/export_sample.py) holds features that were built on the FULL history, plus a
 sample_weight telling you how many real logins each row stands for. Its base rates are deliberately
@@ -26,7 +26,7 @@ from riskengine.features import FEATURES
 from riskengine.training import train
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--sample", default="data/sample_for_claude.parquet")
+ap.add_argument("--sample", default="data/sample.parquet")
 ap.add_argument("--out", default="models_sample")
 ap.add_argument("--unweighted", action="store_true",
                 help="ignore sample_weight - only to demonstrate how far the calibration drifts")

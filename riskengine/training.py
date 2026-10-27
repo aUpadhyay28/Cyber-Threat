@@ -15,6 +15,7 @@ from sklearn.preprocessing import StandardScaler
 
 from . import config as C
 from .features import FEATURES, build_features
+from .hashing import key_fingerprint
 from .modeling import OffHead, RiskModel, _ecdf
 
 _F = {f: i for i, f in enumerate(FEATURES)}
@@ -237,7 +238,8 @@ def train(df, out_dir: str, feedback_rows: pd.DataFrame | None = None,
               "ip_head": ip_report, "takeover_head": takeover_report,
               "feedback_rows_used": 0 if feedback_rows is None else int(len(feedback_rows))}
     version = time.strftime("%Y%m%d-%H%M%S")
-    model.meta = {"version": version, "trained_rows": n, "features": FEATURES, "report": report}
+    model.meta = {"version": version, "trained_rows": n, "features": FEATURES, "report": report,
+                  "hash_key_fp": key_fingerprint()}          # audit only: no feature is a raw hash value
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     path = out / f"model_{version}.joblib"; model.save(path); shutil.copy(path, out / "latest.joblib")
     (out / f"report_{version}.json").write_text(json.dumps(report, indent=2)); (out / "latest_report.json").write_text(json.dumps(report, indent=2))

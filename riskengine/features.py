@@ -16,6 +16,7 @@ from collections import deque
 from dataclasses import dataclass
 import numpy as np
 import pandas as pd
+from .hashing import key_fingerprint as _key_fp, check_fingerprint as _check_fp
 from .config import CATS, MAX_FORWARD_JUMP_MS
 
 _C = 0x9E3779B97F4A7C15
@@ -382,6 +383,7 @@ class FeatureState:
         return {
             "format": "riskengine-feature-state",
             "version": self.STATE_FORMAT_VERSION,
+            "hash_key_fp": _key_fp(),          # which RISK_HASH_KEY these user/IP hashes were made with
             "glob_total": int(self.glob_total),
             "max_ts": None if self.max_ts is None else int(self.max_ts),
             "users": {str(u): [v[0], v[1], v[2], v[3], v[4]] for u, v in self.users.items()},
@@ -399,6 +401,7 @@ class FeatureState:
             raise ValueError("not a risk-engine state document")
         if int(d.get("version", 0)) > cls.STATE_FORMAT_VERSION:
             raise ValueError(f"state version {d['version']} is newer than this code understands")
+        _check_fp(d.get("hash_key_fp"), "this state file")
         st = cls(max_forward_jump_ms=max_forward_jump_ms)
         st.glob_total = int(d.get("glob_total", 0))
         st.max_ts = None if d.get("max_ts") is None else int(d["max_ts"])

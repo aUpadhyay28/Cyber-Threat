@@ -23,12 +23,12 @@ if not a.i_trust_this_file:
         "Reading a pickle executes code embedded in it. Pass the flag only for a state file you\n"
         "created and have kept under your own control; otherwise rebuild from scripts/import_history.py.")
 
-import pickle                                            # noqa: E402  (deliberate, see docstring)
+import pickle  # noqa: E402  # nosec B403
 from riskengine.features import FeatureState
 from riskengine.persist import save_state
 
 with open(a.src, "rb") as fh:
-    st = pickle.load(fh)
+    st = pickle.load(fh)  # nosec B301
 if not isinstance(st, FeatureState):
     raise SystemExit(f"{a.src} does not contain a FeatureState (got {type(st).__name__})")
 save_state(st, a.dst)

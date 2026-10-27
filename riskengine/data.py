@@ -4,12 +4,14 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from .config import RAW_COLUMNS as RC, CATS
+from .hashing import hash_key, key_fingerprint, check_fingerprint
 
 _EPOCH = pd.Timestamp("1970-01-01")
 
 
 def _hash(s: pd.Series) -> np.ndarray:
-    return pd.util.hash_array(s.to_numpy(dtype=object))          # deterministic uint64
+    # Keyed SipHash: deterministic for a given RISK_HASH_KEY, not reversible without it (riskengine/hashing.py).
+    return pd.util.hash_array(s.to_numpy(dtype=object), hash_key=hash_key())
 
 
 def _to_ms(s: pd.Series) -> np.ndarray:
@@ -103,7 +105,7 @@ def event_to_row(ev: dict) -> dict:
                 except (TypeError, ValueError):
                     v = None
         vals.append(_as_text_scalar(v))
-    h = pd.util.hash_array(np.array(vals, dtype=object))
+    h = pd.util.hash_array(np.array(vals, dtype=object), hash_key=hash_key())
 
     row = {"ts_ms": _ts_ms_scalar(ev[RC["ts"]]), "user": int(h[0])}
     for i, c in enumerate(CATS, start=1):
@@ -122,6 +124,21 @@ def event_to_row(ev: dict) -> dict:
     return row
 
 
+PREPARED_KEY_FILE = "hash_key.txt"
+
+
+def write_prepared_fingerprint(data_dir) -> None:
+    """Record which hash key produced a prepared-data folder (the fingerprint, never the key)."""
+    from pathlib import Path
+    Path(data_dir, PREPARED_KEY_FILE).write_text(key_fingerprint() + "\n")
+
+
+def read_prepared_fingerprint(data_dir) -> str | None:
+    from pathlib import Path
+    f = Path(data_dir, PREPARED_KEY_FILE)
+    return f.read_text().strip() if f.exists() else None
+
+
 def load_prepared(data_dir: str, max_rows: int | None = None) -> pd.DataFrame:
     """Read the prepared parquet parts into ONE table without holding two copies in memory
     (pd.concat of a list of parts needs about twice the final size)."""
@@ -130,6 +147,7 @@ def load_prepared(data_dir: str, max_rows: int | None = None) -> pd.DataFrame:
     parts = sorted(glob.glob(f"{data_dir}/part_*.parquet"))
     if not parts:
         raise FileNotFoundError(f"No parquet parts in {data_dir} - run scripts/prepare_data.py first")
+    check_fingerprint(read_prepared_fingerprint(data_dir), f"prepared data in {data_dir}")
     total = sum(pq.ParquetFile(p).metadata.num_rows for p in parts)
     n = total if max_rows is None else min(total, max_rows)
     first = pd.read_parquet(parts[0])

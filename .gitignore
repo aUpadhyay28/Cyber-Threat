@@ -14,6 +14,7 @@ nohup.out
 # RISK_API_KEY and friends belong in the environment or a secrets manager, never in the tree.
 .env
 .env.*
+!.env.example
 *.key
 *.pem
 

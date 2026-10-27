@@ -19,9 +19,12 @@ ENV RISK_MODEL_PATH=/app/models/latest.joblib \
     RISK_STATE_PATH=/data/state.json.gz \
     RISK_DB_PATH=/data/risk.db \
     RISK_TIMESTAMP_SOURCE=server \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
 
-RUN mkdir -p /data /app/models && chown -R risk:risk /data /app
+# Code is owned by root and read-only to the service user; only /data is writable.
+RUN mkdir -p /data /app/models && chown -R risk:risk /data && chmod 700 /data
 VOLUME /data
 USER risk
 EXPOSE 8000
@@ -29,4 +32,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
   CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=2).status==200 else 1)"
 
-CMD ["uvicorn", "riskengine.api:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "riskengine.api:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--no-server-header"]

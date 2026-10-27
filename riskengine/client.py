@@ -79,7 +79,7 @@ class RiskClient:
     """
 
     base_url: str
-    api_key: str
+    api_key: str = field(repr=False)
     timeout_seconds: float = 1.0
     fail_open: bool = True
     breaker_threshold: int = 5
@@ -90,6 +90,18 @@ class RiskClient:
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _consecutive_failures: int = field(default=0, repr=False)
     _breaker_until: float = field(default=0.0, repr=False)
+
+    def __post_init__(self) -> None:
+        # urllib also opens file:// and other schemes; a misconfigured or injected base_url must not
+        # turn the login path into a local-file reader.
+        from urllib.parse import urlsplit
+        if urlsplit(self.base_url).scheme not in ("http", "https"):
+            raise ValueError(f"base_url must be http:// or https://, got {self.base_url!r}")
+        if not self.api_key:
+            raise ValueError("api_key is required")
+
+    def __repr__(self) -> str:                      # never print the key into a log or traceback
+        return f"RiskClient(base_url={self.base_url!r}, api_key='***', timeout_seconds={self.timeout_seconds})"
 
     # ------------------------------------------------------------------ breaker
     def _breaker_is_open(self) -> bool:
@@ -181,7 +193,8 @@ class RiskClient:
             headers={"Content-Type": "application/json", "X-API-Key": self.api_key},
             method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
+            # scheme restricted to http(s) in __post_init__
+            with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:  # nosec B310
                 return json.loads(resp.read().decode())
         except urllib.error.HTTPError as exc:
             # 4xx means we sent something wrong - worth surfacing loudly in your tests, but at

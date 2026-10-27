@@ -43,6 +43,7 @@ import math
 import uuid
 from typing import Optional
 
+from .hashing import key_fingerprint, check_fingerprint
 from .config import CATS, MAX_FORWARD_JUMP_MS, STATE_RETENTION_MS
 from .features import DAY_MS, HOUR_MS, StateReads, TimestampOutOfRange, compute_features, mix_py
 
@@ -66,6 +67,14 @@ class RedisFeatureState:
         self.retention_ms = retention_ms
         self.max_forward_jump_ms = max_forward_jump_ms
         self._glob_total_cache: Optional[int] = None
+        # Every key below embeds hashed user/IP values, so a Redis keyspace built under one
+        # RISK_HASH_KEY is meaningless under another. The first process to start claims it.
+        fp_key = self._k("hash_key_fp")
+        self.r.setnx(fp_key, key_fingerprint())
+        recorded = self.r.get(fp_key)
+        if isinstance(recorded, bytes):
+            recorded = recorded.decode()
+        check_fingerprint(recorded, f"the Redis keyspace {self.p!r}")
 
     # ------------------------------------------------------------------ keys
     def _k(self, *parts) -> str:

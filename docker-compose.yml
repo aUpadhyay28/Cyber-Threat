@@ -5,6 +5,8 @@
 #   export RISK_MODEL_SHA256="$(cat models/latest.joblib.sha256)"
 #   docker compose up
 #
+# or copy .env.example to .env, fill it in, and just run `docker compose up`.
+#
 # Two deliberate choices worth noticing:
 #
 #  * the service binds to 127.0.0.1 on the host, not 0.0.0.0. This API must never be reachable from
@@ -17,9 +19,15 @@ services:
     image: redis:7-alpine
     # AOF on: the behavioural state is worth keeping across a restart. It is NOT the audit trail
     # (that is SQLite/Postgres), so losing the last second of it costs accuracy, not records.
-    command: ["redis-server", "--appendonly", "yes", "--save", "900 1"]
+    # Password required: whoever can write to Redis can rewrite every account's "normal" profile.
+    # No ports: Redis is reachable only from the risk service on the compose network.
+    command: ["sh", "-c", "exec redis-server --appendonly yes --save '900 1' --requirepass \"$$REDIS_PASSWORD\" --rename-command FLUSHALL '' --rename-command FLUSHDB '' --rename-command CONFIG '' --rename-command DEBUG ''"]
+    environment:
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?set REDIS_PASSWORD to a long random secret}"
+      REDISCLI_AUTH: "${REDIS_PASSWORD}"
     volumes:
       - redis-data:/data
+    security_opt: ["no-new-privileges:true"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -33,19 +41,27 @@ services:
     # p50 latency eight times worse for a ~20% throughput gain. Re-run scripts/loadtest.py after
     # changing this; the number that matters is p99, because the client timeout has to clear it.
     command: ["uvicorn", "riskengine.api:create_app", "--factory",
-              "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+              "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--no-server-header"]
     environment:
+      # One key per role - see riskengine/secrets_config.py. The login backend gets only RISK_API_KEY.
       RISK_API_KEY: "${RISK_API_KEY:?set RISK_API_KEY to a long random secret}"
+      RISK_ANALYST_KEY: "${RISK_ANALYST_KEY:?set RISK_ANALYST_KEY (the review console's key)}"
+      RISK_ADMIN_KEY: "${RISK_ADMIN_KEY:?set RISK_ADMIN_KEY (erasure and model reload)}"
+      RISK_METRICS_TOKEN: "${RISK_METRICS_TOKEN:-}"
+      # Keys the hashes of user IDs and IPs. Must match the key used for import_history.py.
+      RISK_HASH_KEY: "${RISK_HASH_KEY:?set RISK_HASH_KEY to a long random secret}"
+      # production = refuse to start unless timestamps, hashing, model pin and GeoIP are all set.
+      RISK_ENV: "${RISK_ENV:-production}"
       RISK_MODEL_SHA256: "${RISK_MODEL_SHA256:-}"
       RISK_MODEL_PATH: /app/models/latest.joblib
       RISK_DB_PATH: /data/risk.db
-      RISK_REDIS_URL: redis://redis:6379/0
+      RISK_REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
       # Server clock, never the caller's: a future-dated login would clear the activity windows an
       # attacking IP is judged by. See SECURITY.md.
       RISK_TIMESTAMP_SOURCE: server
       # Resolve country/ASN from the IP. Without the databases this falls back to trusting the
       # caller, which makes the home-country policy bypassable - mount them and set this to maxmind.
-      RISK_GEOIP_MODE: "${RISK_GEOIP_MODE:-client}"
+      RISK_GEOIP_MODE: "${RISK_GEOIP_MODE:-maxmind}"
       RISK_GEOIP_COUNTRY_DB: /app/geoip/GeoLite2-Country.mmdb
       RISK_GEOIP_ASN_DB: /app/geoip/GeoLite2-ASN.mmdb
       RISK_HOME_COUNTRIES: "${RISK_HOME_COUNTRIES:-}"
@@ -57,6 +73,14 @@ services:
       - ./models:/app/models:ro
       - ./geoip:/app/geoip:ro
       - risk-data:/data
+    # Least privilege: no root (see Dockerfile), no capabilities, no privilege escalation, and a
+    # read-only filesystem except the data volume and a small /tmp.
+    read_only: true
+    tmpfs: ["/tmp:size=64m,mode=1777"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    mem_limit: 2g
+    pids_limit: 256
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:

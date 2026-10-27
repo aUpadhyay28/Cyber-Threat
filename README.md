@@ -19,7 +19,8 @@ thresholds works for both: Medium = top 2% of normal logins per head (risk >= 98
 ```bash
 python -m venv .venv && source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-pytest -q                                                 # 53 tests, ~2 min
+pip install fakeredis                                     # optional: lets the Redis tests run without a server
+pytest -q                                                 # 186 tests, ~2 min
 ```
 
 ## 2. Train
@@ -37,8 +38,8 @@ current code, because features are located by position and a mismatch would sile
 
 ### Developing on the 11 MB sample instead of the 31 M rows
 ```bash
-python scripts/export_sample.py --data data/prepared --out data/sample_for_claude.parquet   # once
-python scripts/train_from_sample.py --sample data/sample_for_claude.parquet --out models_sample
+python scripts/export_sample.py --data data/prepared --out data/sample.parquet   # once
+python scripts/train_from_sample.py --sample data/sample.parquet --out models_sample
 ```
 The sample is **stratified**: attacks are over-represented on purpose and each row carries a `sample_weight`
 saying how many real logins it stands for (they sum back to 31,269,264). Everything in `train_from_sample.py`
@@ -54,14 +55,60 @@ file before shipping.
 ## 3. Run the scoring service
 ```bash
 export RISK_API_KEY="$(python -c 'import secrets;print(secrets.token_urlsafe(32))')"   # >= 24 chars, enforced
+export RISK_ANALYST_KEY="$(python -c 'import secrets;print(secrets.token_urlsafe(32))')"  # review console
+export RISK_ADMIN_KEY="$(python -c 'import secrets;print(secrets.token_urlsafe(32))')"    # erasure, model reload
+export RISK_HASH_KEY="$(python -c 'import secrets;print(secrets.token_urlsafe(32))')"  # keyed hashing of user IDs / IPs
 export RISK_MODEL_SHA256=$(cat models/latest.joblib.sha256)                            # refuse a swapped model
 uvicorn riskengine.api:create_app --factory --port 8000       # then open http://127.0.0.1:8000/docs
 ```
 `POST /v1/score` returns `risk_score`, `tier`, `action`, `ip_risk`, `takeover_risk` (null for accounts with too
-little history), `reasons`, `event_id`, `warming_up`, `model_version`. Other endpoints: `/v1/confirm/{id}` (user
-passed the OTP -> the login joins their normal profile; a *failed* login cannot be confirmed), `/v1/queue`,
-`/v1/verdict` (analyst), `/v1/admin/reload-model`, `/v1/admin/forget-user`, `/v1/admin/purge-raw`,
-`/v1/admin/prune-state`, `/health`.
+little history), `model_tier` (the model's own verdict, before any policy rule), `reasons`, `event_id`,
+`warming_up`, `model_version`.
+
+| Endpoint | Key | What it does |
+|---|---|---|
+| `POST /v1/score` | `RISK_API_KEY` | score one login |
+| `POST /v1/confirm/{id}` | `RISK_API_KEY` | user passed the OTP; the login joins their normal profile (a *failed* login cannot be confirmed) |
+| `GET /v1/queue`, `GET /v1/event/{id}`, `POST /v1/verdict`, `GET /v1/stats` | `RISK_ANALYST_KEY` (or admin) | review queue and labelling |
+| `POST /v1/admin/reload-model`, `forget-user`, `purge-raw`, `prune-state` | `RISK_ADMIN_KEY` | model swap, erasure, retention |
+| `GET /console` | analyst key, typed into the page | the review console |
+| `GET /health`, `GET /ready`, `GET /metrics` | none (`/metrics` optionally `RISK_METRICS_TOKEN`) | status, readiness probe, Prometheus metrics |
+
+A key used outside its role gets **403** and is logged. In development, an unset analyst or admin key falls back to
+`RISK_API_KEY` so the demo runs with one secret; production mode refuses that. Any key can instead be read from a
+file (`RISK_API_KEY_FILE=/run/secrets/...`), and each variable accepts several comma-separated keys for rotation.
+
+### Production mode
+
+```bash
+export RISK_ENV=production
+```
+
+With `RISK_ENV=production` the service **refuses to start** unless every setting in `PRODUCTION.md` stage 0 that can
+be checked from inside the process is on: server timestamps, a `RISK_HASH_KEY`, a pinned model,
+`RISK_GEOIP_MODE=maxmind`, three different role keys and a password on Redis. It lists every missing item at once.
+Production mode also turns off `/docs` and `/openapi.json` and reduces the unauthenticated `/health` to
+`{"status": "ok"}` (the full view needs an analyst or admin key). In development none of this is enforced, so the
+demo and the tests still run on a laptop. See `SECURITY.md` for the full threat model.
+
+### Running it for real: what else is in the box
+
+* **`python scripts/generate_secrets.py`** – writes a `.env` with fresh, distinct random keys (owner-only file).
+* **`docker compose up`** – the service plus a password-protected Redis, bound to 127.0.0.1 only, non-root,
+  read-only filesystem, no Linux capabilities, model mounted read-only, shadow mode by default. Copy `.env.example`
+  to `.env` and fill it in first.
+* **Shared state** – set `RISK_REDIS_URL` and several workers share one set of counters (`riskengine/redis_state.py`).
+  Without it, each worker would see only its own share of an attacking IP's traffic.
+* **Server-side geolocation** – `RISK_GEOIP_MODE=maxmind` with the free GeoLite2 Country and ASN databases
+  (`riskengine/geoip.py`). Without them the caller supplies country and ASN, which means an attacker does.
+* **Home-country rule** – `RISK_HOME_COUNTRIES=IN` raises a login from a country this account has never used to at
+  least Medium (step-up), never to a block (`riskengine/policy.py`).
+* **Client library** – `riskengine/client.py`: timeout, fail-open by default, circuit breaker and a `degraded` counter.
+  Use it from your login backend rather than calling the API by hand.
+* **Analyst console** – `/console` in a browser: the review queue, event detail and verdict buttons.
+* **Assistant tools** – `python -m riskengine.mcp_server` exposes the queue to an LLM assistant with defences against
+  tool-output poisoning; the assistant can propose a verdict but never record one.
+* **Load test** – `scripts/loadtest.py` measures throughput and p99 on your hardware. Set the client timeout above p99.
 
 ### Timestamps are not taken from the caller
 By default (`RISK_TIMESTAMP_SOURCE=server`) the service timestamps each login with its own clock. The 1 h / 24 h
@@ -127,13 +174,18 @@ Low risk and successful, or the user (OTP) or an analyst confirmed it, so an att
   by user rather than time-split — the time split has no positives to score.
 
 ## Known limits
-* Not validated on real traffic. Country/ASN must come from the server (MaxMind GeoLite2), not the client.
-* Live state is a JSON snapshot + SQLite: fine for one server; use Redis/Postgres for several. The in-process
-  rate limiter is also per worker.
-* `/v1/score` does feature computation, scoring, the state update and the event write under one lock, and
-  snapshots the state every 200 events. That lock is the throughput ceiling; moving the write off the hot path
-  is the next piece of work.
-* IPs, devices and user IDs are personal data. There are now mechanisms for retention and erasure (above), but
-  identifiers are hashed with an unsalted `pd.util.hash_array`: fine for this public dataset, not for real data
-  keyed by email or sequential IDs — use a keyed HMAC there.
-* `SECURITY.md` records the threat model, what is defended, and what an attacker would try next.
+
+* **Not validated on real traffic.** The shipped model is fitted on synthetic benchmark data. A real deployment must
+  run in shadow mode on its own logins and retrain before enforcing anything – see `PRODUCTION.md`.
+* **No labels on a real site.** Real logins do not arrive marked "attack" or "takeover"; the analyst queue is how
+  labels get made, so the system only improves if someone reviews it.
+* **Low-and-slow attacks.** One attempt per IP per day across a large botnet produces no window signal. That is a
+  limit of the features, not a bug.
+* **The API key is the whole trust boundary.** Anything holding it can assert any user and outcome. Keep the service
+  off the internet (the compose file binds it to 127.0.0.1).
+* **Profile building.** An attacker with valid credentials who logs in quietly for a while becomes "normal" for that
+  account. Step-up on sensitive actions, not only at login.
+* `SECURITY.md` records the full threat model: what is defended, what is not, and what an attacker would try next.
+
+Fixed since earlier versions: the scoring lock no longer covers disk writes (they run on a background thread);
+several workers can share state through Redis; identifiers can be hashed with a secret key (`RISK_HASH_KEY`).

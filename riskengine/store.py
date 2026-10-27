@@ -2,7 +2,7 @@
 (benign / confirmed_malicious) can ever become training data - 'suspicious' and unreviewed
 events never do. This is the human-validation gate of the project."""
 from __future__ import annotations
-import json, sqlite3, threading
+import json, os, sqlite3, threading
 from datetime import datetime, timezone
 import pandas as pd
 from .config import VERDICTS, LEARNABLE_VERDICTS
@@ -47,6 +47,14 @@ def _json_safe(obj):
 
 class Store:
     def __init__(self, path: str = "data/risk.db"):
+        # The audit DB holds raw IPs and user agents: owner-only, whatever the umask says.
+        if path != ":memory:":
+            os.makedirs(os.path.dirname(os.path.abspath(path)), mode=0o700, exist_ok=True)
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600); os.close(fd)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:                            # e.g. a Windows filesystem: best effort
+                pass
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.lock = threading.Lock()
@@ -211,7 +219,7 @@ class Store:
         with self.lock:
             rows = self.db.execute(
                 "SELECT e.features_json, v.verdict FROM events e JOIN verdicts v ON v.event_id=e.event_id "
-                "WHERE v.verdict IN (%s)" % ",".join("?" * len(LEARNABLE_VERDICTS)),
+                "WHERE v.verdict IN (%s)" % ",".join("?" * len(LEARNABLE_VERDICTS)),  # nosec B608
                 tuple(LEARNABLE_VERDICTS)).fetchall()
         recs = []
         for r in rows:

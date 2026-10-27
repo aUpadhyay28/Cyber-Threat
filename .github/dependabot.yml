@@ -1,0 +1,14 @@
+# Weekly pull requests when a dependency, a GitHub Action or the Docker base image has an update -
+# security fixes included. Review and merge them; CI runs the full suite and the security scans.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule: {interval: weekly}
+    open-pull-requests-limit: 5
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: {interval: weekly}
+  - package-ecosystem: docker
+    directory: /
+    schedule: {interval: weekly}

@@ -13,9 +13,12 @@ Security model
 * The model file's digest is verified before it is deserialised (RISK_MODEL_SHA256 or a .sha256 file).
 * Every decision records which model version made it.
 * Scores and reasons are internal. `explain()` output tells an attacker what to evade.
+* Three keys for three roles (riskengine/secrets_config.py): the login backend can score and confirm,
+  the analyst console can review, only the admin key can erase accounts or swap the model.
+* RISK_ENV=production hides /docs and the detailed /health, and refuses to start misconfigured.
 """
 from __future__ import annotations
-import hmac, ipaddress, json, logging, os, queue, threading, time, uuid
+import hashlib, ipaddress, json, logging, os, queue, threading, time, uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -31,6 +34,8 @@ from .config import RAW_COLUMNS as RC
 from .data import event_to_row
 from .features import FeatureState, TimestampOutOfRange
 from .geoip import apply_resolution, build_resolver
+from .hashing import hash_key, is_keyed
+from .secrets_config import KeyRing
 from .policy import HomeCountryPolicy
 from .modeling import RiskModel, explain
 from .observability import Metrics, configure_logging
@@ -47,6 +52,9 @@ WARMUP_MIN_EVENTS = int(os.getenv("RISK_WARMUP_MIN_EVENTS", "10000"))
 MIN_API_KEY_LEN = 24
 RATE_LIMIT_PER_MIN = int(os.getenv("RISK_RATE_LIMIT_PER_MIN", "1200"))   # 0 disables
 MAX_ID_LEN = 200
+# Every legitimate request body here is well under 4 KB. A cap stops a caller holding a key - or a
+# compromised one - from tying up a worker parsing a multi-megabyte JSON document.
+MAX_BODY_BYTES = int(os.getenv("RISK_MAX_BODY_BYTES", "65536"))
 WRITE_QUEUE_MAX = int(os.getenv("RISK_WRITE_QUEUE_MAX", "64"))
 
 
@@ -133,23 +141,85 @@ def _valid_ip(value: str) -> str:
         raise HTTPException(422, "ip must be a valid IPv4 or IPv6 address") from None
 
 
+def _tag(value) -> str:
+    """A short, keyed, non-reversible tag for a user ID or IP in log lines.
+
+    Logs are copied to places with far weaker controls than the database (log shippers, support
+    tickets, a laptop), and they are not touched by /v1/admin/forget-user - so an erased account
+    whose ID sat in plain text in last month's logs was not erased. The tag still lets you follow one
+    account through the logs, and an analyst can compute it for a known ID to search for it.
+    """
+    return "u:" + hashlib.blake2b(str(value).encode(), key=hash_key().encode(), digest_size=6).hexdigest()
+
+
+def _csp_for(html: str) -> str:
+    """A Content-Security-Policy that allows exactly the console's own inline script (by hash) and
+    nothing else: no external scripts, no inline event handlers, no requests to other origins. If an
+    attacker-controlled string ever did reach the DOM as markup, it could not run."""
+    import base64, re
+    def hashes(tag):
+        return " ".join("'sha256-%s'" % base64.b64encode(hashlib.sha256(m.encode()).digest()).decode()
+                        for m in re.findall(rf"<{tag}>(.*?)</{tag}>", html, flags=re.S))
+    # Styles stay 'unsafe-inline': the page sets a few style attributes, and a hash list would make
+    # browsers ignore 'unsafe-inline'. Injected CSS cannot run code; injected script is what matters.
+    return (f"default-src 'none'; script-src {hashes('script')}; style-src 'unsafe-inline'; "
+            "img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; "
+            "frame-ancestors 'none'")
+
+
+API_CSP = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+
+
+def check_production_config(ts_source: str, model_sha256: str | None, model_path: str = "models/latest.joblib",
+                            skip_geo: bool = False, keys: "KeyRing | None" = None) -> None:
+    """Refuse to start in RISK_ENV=production unless the settings PRODUCTION.md stage 0 requires are on.
+
+    Each item here is something that works fine in a demo and silently weakens a real deployment, so
+    it is better to fail loudly at startup than to discover it in an incident review.
+    """
+    problems = []
+    if ts_source != "server":
+        problems.append("RISK_TIMESTAMP_SOURCE must be 'server' (a caller-supplied time can wipe an IP's history)")
+    if not is_keyed():
+        problems.append("RISK_HASH_KEY is not set: user IDs and IPs would be hashed with a public key "
+                        "and could be reversed by enumeration")
+    if not model_sha256 and not Path(str(model_path) + ".sha256").exists():
+        problems.append("the model is not pinned: set RISK_MODEL_SHA256 or run scripts/pin_model.py")
+    if not skip_geo and os.getenv("RISK_GEOIP_MODE", "client").lower() != "maxmind":
+        problems.append("RISK_GEOIP_MODE must be 'maxmind' with GeoLite2 databases (otherwise the caller "
+                        "chooses the country and ASN)")
+    if os.getenv("RISK_ALLOW_SHORT_KEY"):
+        problems.append("RISK_ALLOW_SHORT_KEY is a test-only switch")
+    if keys is not None:
+        problems.extend(keys.production_problems())
+    if os.getenv("RISK_REDIS_URL") and "@" not in os.getenv("RISK_REDIS_URL", ""):
+        problems.append("RISK_REDIS_URL has no password: anyone who can reach Redis can rewrite every "
+                        "user's profile (use redis://:PASSWORD@host:6379/0)")
+    if problems:
+        raise RuntimeError("RISK_ENV=production but the service is not production-configured:\n  - "
+                           + "\n  - ".join(problems) + "\nSee PRODUCTION.md, stage 0.")
+
+
 def create_app(model_path=None, state_path=None, db_path=None, api_key=None,
-               timestamp_source=None, model_sha256=None, geo_resolver=None, policy=None) -> FastAPI:
+               timestamp_source=None, model_sha256=None, geo_resolver=None, policy=None,
+               analyst_key=None, admin_key=None) -> FastAPI:
     model_path = model_path or os.getenv("RISK_MODEL_PATH", "models/latest.joblib")
     state_path = state_path or os.getenv("RISK_STATE_PATH", "data/state.json.gz")
     db_path = db_path or os.getenv("RISK_DB_PATH", "data/risk.db")
-    api_key = api_key or os.getenv("RISK_API_KEY")
     model_sha256 = model_sha256 or os.getenv("RISK_MODEL_SHA256")
     ts_source = (timestamp_source or os.getenv("RISK_TIMESTAMP_SOURCE", C.TIMESTAMP_SOURCE)).lower()
     if ts_source not in ("server", "client"):
         raise RuntimeError("RISK_TIMESTAMP_SOURCE must be 'server' or 'client'")
-    if not api_key:
-        raise RuntimeError("Set RISK_API_KEY (the secret your web backend sends in the X-API-Key header)")
-    if len(api_key) < MIN_API_KEY_LEN and not os.getenv("RISK_ALLOW_SHORT_KEY"):
-        raise RuntimeError(
-            f"RISK_API_KEY is {len(api_key)} characters; use at least {MIN_API_KEY_LEN} random ones "
-            f"(e.g. `python -c \"import secrets;print(secrets.token_urlsafe(32))\"`). "
-            f"Set RISK_ALLOW_SHORT_KEY=1 only for tests.")
+    keys = KeyRing.from_env(api_key, analyst_key, admin_key)
+
+    # RISK_ENV=production turns every "you should set this before real users" warning into a refusal
+    # to start. A service that boots is then a service that is configured, not merely one that runs.
+    run_env = os.getenv("RISK_ENV", "development").lower()
+    production = run_env == "production"
+    if production:
+        check_production_config(ts_source=ts_source, model_sha256=model_sha256,
+                                model_path=model_path, skip_geo=geo_resolver is not None, keys=keys)
+    metrics_token = os.getenv("RISK_METRICS_TOKEN", "")
 
     # In "server" mode timestamps come from this process's clock, which is trusted, so the state does
     # not need the forward-jump guard - a genuine long gap SHOULD expire the activity windows. In
@@ -265,26 +335,76 @@ def create_app(model_path=None, state_path=None, db_path=None, api_key=None,
         else:
             log.info("risk service stopped; shared state remains in Redis")
 
-    app = FastAPI(title="Adaptive Login Risk Service", lifespan=lifespan)
+    # The interactive docs list every endpoint and its parameters - a map for anyone probing the
+    # service - and load their scripts from a CDN. Useful on a laptop, not in production.
+    docs = {} if not production else {"docs_url": None, "redoc_url": None, "openapi_url": None}
+    app = FastAPI(title="Adaptive Login Risk Service", lifespan=lifespan, **docs)
+    console_page = Path(__file__).with_name("console.html")
+    console_html = console_page.read_text(encoding="utf-8") if console_page.exists() else None
+    console_csp = _csp_for(console_html) if console_html else API_CSP
 
     @app.middleware("http")
     async def _headers(request: Request, call_next):
+        # Refuse oversized bodies before anything parses them. Every client this service expects
+        # (RiskClient, httpx, requests, urllib) sends Content-Length with a JSON body, so a body
+        # without one - chunked transfer - is refused outright rather than read to find its size.
+        if request.method in ("POST", "PUT", "PATCH"):
+            declared = request.headers.get("content-length")
+            if declared is None:
+                if request.headers.get("transfer-encoding"):
+                    return Response('{"detail":"Content-Length required"}', 411, media_type="application/json")
+            else:
+                try:
+                    too_big = int(declared) > MAX_BODY_BYTES
+                except ValueError:
+                    return Response('{"detail":"invalid Content-Length"}', 400, media_type="application/json")
+                if too_big:
+                    return Response('{"detail":"request body too large"}', 413, media_type="application/json")
         resp = await call_next(request)
+        path = request.url.path
         resp.headers["X-Content-Type-Options"] = "nosniff"
         resp.headers["X-Frame-Options"] = "DENY"
         resp.headers["Referrer-Policy"] = "no-referrer"
         resp.headers["Cache-Control"] = "no-store"
+        resp.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+        resp.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+        resp.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=()"
+        if path == "/console":
+            resp.headers["Content-Security-Policy"] = console_csp
+        elif not path.startswith(("/docs", "/redoc", "/openapi")):
+            resp.headers["Content-Security-Policy"] = API_CSP
+        if "server" in resp.headers:
+            del resp.headers["server"]
         return resp
 
-    def auth(request: Request, x_api_key: str = Header(default="")):
-        if not hmac.compare_digest(x_api_key, api_key):
-            # Rate-limit by source address on failure so the key cannot be probed quickly.
+    def _check_key(request: Request, presented: str, allowed: set) -> None:
+        granted = keys.role_of(presented)
+        if not granted:
+            # Rate-limit by source address on failure so a key cannot be probed quickly.
             peer = request.client.host if request.client else "unknown"
             if not limiter_holder["limiter"].allow(f"bad:{peer}"):
                 raise HTTPException(429, "too many requests")
             raise HTTPException(401, "invalid API key")
+        if not (granted & allowed):
+            # A valid key used outside its role is not a typo: log it, it is what a leaked login-backend
+            # key being tried against the admin routes looks like.
+            log.warning("key for role(s) %s refused on %s", sorted(granted), request.url.path)
+            metrics.rejected.labels(reason="wrong_role").inc()
+            raise HTTPException(403, "this key is not allowed to call this endpoint")
         if not limiter_holder["limiter"].allow("ok"):
             raise HTTPException(429, "too many requests")
+
+    def auth(request: Request, x_api_key: str = Header(default="")):
+        """Login backend: score and confirm."""
+        _check_key(request, x_api_key, {"service"})
+
+    def analyst_auth(request: Request, x_api_key: str = Header(default="")):
+        """Review console: queue, event detail, verdicts, stats. Admins may also review."""
+        _check_key(request, x_api_key, {"analyst", "admin"})
+
+    def admin_auth(request: Request, x_api_key: str = Header(default="")):
+        """Operators: model reload, erasure, retention."""
+        _check_key(request, x_api_key, {"admin"})
 
     def _event_ts(req: ScoreRequest) -> str:
         """The timestamp this login is scored with, as ISO-8601. data.event_to_row turns it into
@@ -304,7 +424,7 @@ def create_app(model_path=None, state_path=None, db_path=None, api_key=None,
 
     @app.get("/", include_in_schema=False)
     def root():
-        return RedirectResponse("/docs")
+        return RedirectResponse("/console" if production else "/docs")
 
     @app.get("/console", include_in_schema=False)
     def console():
@@ -314,15 +434,18 @@ def create_app(model_path=None, state_path=None, db_path=None, api_key=None,
         serving it from anywhere else would mean either CORS or a second place to configure the
         secret. It is static HTML with no build step and no external requests.
         """
-        page = Path(__file__).with_name("console.html")
-        if not page.exists():
+        if console_html is None:
             raise HTTPException(404, "console.html is missing from the riskengine package")
-        return Response(content=page.read_text(encoding="utf-8"), media_type="text/html; charset=utf-8")
+        return Response(content=console_html, media_type="text/html; charset=utf-8")
 
     @app.get("/metrics", include_in_schema=False)
-    def metrics_endpoint():
-        """Prometheus scrape target. Deliberately unauthenticated and free of personal data, the way
-        a scrape endpoint has to be - keep it reachable only from inside your network."""
+    def metrics_endpoint(authorization: str = Header(default="")):
+        """Prometheus scrape target, free of personal data. Unauthenticated unless RISK_METRICS_TOKEN
+        is set, in which case the scraper must send `Authorization: Bearer <token>`."""
+        if metrics_token:
+            import hmac as _hmac
+            if not _hmac.compare_digest(authorization.encode(), f"Bearer {metrics_token}".encode()):
+                raise HTTPException(401, "metrics token required")
         st = ctx.get("state")
         if st is not None:
             metrics.warming.set(1 if st.glob_total < WARMUP_MIN_EVENTS else 0)
@@ -345,9 +468,15 @@ def create_app(model_path=None, state_path=None, db_path=None, api_key=None,
         return {"ready": True, "model_version": ctx["model"].meta.get("version")}
 
     @app.get("/health")
-    def health():
+    def health(x_api_key: str = Header(default="")):
+        # In production the unauthenticated answer is only "alive": the full view (model digest,
+        # GeoIP mode, user counts) is reconnaissance, so it needs an analyst or admin key.
+        if production and not (keys.role_of(x_api_key) & {"analyst", "admin"}):
+            return {"status": "ok"}
         m = ctx["model"].meta
         return {"status": "ok", "model_version": m.get("version"),
+                "env": os.getenv("RISK_ENV", "development").lower(),
+                "identifier_hashing": "keyed" if is_keyed() else "unkeyed (benchmark only)",
                 "model_sha256": ctx.get("model_sha256"),
                 "timestamp_source": ctx["ts_source"],
                 "geoip_source": ctx["geo"].name,
@@ -366,7 +495,7 @@ def create_app(model_path=None, state_path=None, db_path=None, api_key=None,
         # signals here, so letting the caller supply them means letting an attacker choose them.
         geo = apply_resolution(ctx["geo"], ip, req.country, req.asn)
         if geo["geo_mismatch"]:
-            log.warning("geo mismatch for %s from %s: caller said %s, %s says %s", req.user_id, ip,
+            log.warning("geo mismatch for %s from %s: caller said %s, %s says %s", _tag(req.user_id), _tag(ip),
                         geo["geo_mismatch"]["claimed"], ctx["geo"].name, geo["geo_mismatch"]["resolved"])
         raw = {RC["ts"]: ts_iso, RC["user"]: req.user_id, RC["ip"]: ip,
                RC["country"]: geo["country"], RC["asn"]: geo["asn"], RC["browser"]: req.browser,
@@ -381,7 +510,7 @@ def create_app(model_path=None, state_path=None, db_path=None, api_key=None,
             try:
                 ctx["state"].check_timestamp(row["ts_ms"])
             except TimestampOutOfRange as e:
-                log.warning("rejected a login for %s: %s", req.user_id, e)
+                log.warning("rejected a login for %s: %s", _tag(req.user_id), e)
                 metrics.rejected.labels(reason="timestamp_out_of_range").inc()
                 raise HTTPException(422, "timestamp is too far ahead of the events already recorded") from None
             feats = ctx["state"].features(row)
@@ -457,11 +586,11 @@ def create_app(model_path=None, state_path=None, db_path=None, api_key=None,
             raise HTTPException(409, "a failed login cannot be confirmed into the user's normal profile")
         return {"event_id": event_id, "added_to_profile": _trust(event_id)}
 
-    @app.get("/v1/queue", dependencies=[Depends(auth)])
+    @app.get("/v1/queue", dependencies=[Depends(analyst_auth)])
     def review_queue(limit: int = Query(50, ge=1, le=500)):
         return ctx["store"].queue(limit)
 
-    @app.get("/v1/stats", dependencies=[Depends(auth)])
+    @app.get("/v1/stats", dependencies=[Depends(analyst_auth)])
     def stats(hours: float = Query(24.0, gt=0, le=24 * 90)):
         """Counts for the analyst console: tier mix, queue depth, verdicts, model versions seen."""
         out = ctx["store"].stats(hours)
@@ -481,7 +610,7 @@ def create_app(model_path=None, state_path=None, db_path=None, api_key=None,
         }
         return out
 
-    @app.get("/v1/event/{event_id}", dependencies=[Depends(auth)])
+    @app.get("/v1/event/{event_id}", dependencies=[Depends(analyst_auth)])
     def event_detail(event_id: str):
         """One event, for the console's review pane."""
         ev = ctx["store"].get_event(event_id)
@@ -497,7 +626,7 @@ def create_app(model_path=None, state_path=None, db_path=None, api_key=None,
             "features": _json_safe(json.loads(ev["features_json"] or "{}")),
         }
 
-    @app.post("/v1/verdict", dependencies=[Depends(auth)])
+    @app.post("/v1/verdict", dependencies=[Depends(analyst_auth)])
     def verdict(v: VerdictRequest):
         """Analyst decision. Stored for the NEXT retraining run - the live model never changes by itself."""
         try:
@@ -507,7 +636,7 @@ def create_app(model_path=None, state_path=None, db_path=None, api_key=None,
         if v.verdict == "benign": _trust(v.event_id)
         return {"event_id": v.event_id, "verdict": v.verdict, "used_for_training": v.verdict != "suspicious"}
 
-    @app.post("/v1/admin/reload-model", dependencies=[Depends(auth)])
+    @app.post("/v1/admin/reload-model", dependencies=[Depends(admin_auth)])
     def reload_model():
         digest = verify_model(model_path, model_sha256)
         with ctx["lock"]:
@@ -516,28 +645,29 @@ def create_app(model_path=None, state_path=None, db_path=None, api_key=None,
         log.info("model reloaded: version=%s sha256=%s", ctx["model"].meta.get("version"), digest)
         return {"model_version": ctx["model"].meta.get("version"), "model_sha256": digest}
 
-    @app.post("/v1/admin/forget-user", dependencies=[Depends(auth)])
+    @app.post("/v1/admin/forget-user", dependencies=[Depends(admin_auth)])
     def forget_user(req: ForgetRequest):
         """Right to erasure: remove an account from the live profiles and delete its logged events."""
         with ctx["lock"]:
             values = ctx["store"].user_category_values(req.user_id)
             row = event_to_row({RC["ts"]: datetime.now(timezone.utc).isoformat(), RC["user"]: req.user_id,
-                                RC["ip"]: "0.0.0.0", RC["country"]: None, RC["asn"]: None,
+                                RC["ip"]: "0.0.0.0",  # nosec B104
+                                RC["country"]: None, RC["asn"]: None,
                                 RC["browser"]: None, RC["os"]: None, RC["device"]: None,
                                 RC["rtt"]: None, RC["success"]: True})
             state_result = ctx["state"].forget_user(row["user"], values)
             db_result = ctx["store"].forget_user(req.user_id)
             _snapshot_locked()
         _flush()                       # erasure must be durable before we report it done
-        log.info("erased account %s: %s %s", req.user_id, state_result, db_result)
+        log.info("erased account %s: %s %s", _tag(req.user_id), state_result, db_result)
         return {"user_id": req.user_id, "state": state_result, "database": db_result}
 
-    @app.post("/v1/admin/purge-raw", dependencies=[Depends(auth)])
+    @app.post("/v1/admin/purge-raw", dependencies=[Depends(admin_auth)])
     def purge_raw(days: int = Query(C.RAW_EVENT_RETENTION_DAYS, ge=1, le=3650)):
         """Delete the raw login payload (IP, user agent) from events older than `days`."""
         return {"events_purged": ctx["store"].purge_raw_older_than(days), "retention_days": days}
 
-    @app.post("/v1/admin/prune-state", dependencies=[Depends(auth)])
+    @app.post("/v1/admin/prune-state", dependencies=[Depends(admin_auth)])
     def prune_state(days: int = Query(C.STATE_RETENTION_MS // 86_400_000, ge=1, le=3650)):
         """Drop per-IP / per-ASN state idle for longer than `days`: bounds memory and enforces retention."""
         with ctx["lock"]:

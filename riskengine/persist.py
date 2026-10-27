@@ -40,7 +40,9 @@ def write_state_data(data: dict, path: str | os.PathLike) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
     payload = json.dumps(data, separators=(",", ":")).encode()
-    with gzip.open(tmp, "wb", compresslevel=6) as fh:
+    # Owner-only from the moment it exists: the state holds every account's behavioural profile.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=6) as fh:
         fh.write(payload)
     os.replace(tmp, path)
 

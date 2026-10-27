@@ -40,3 +40,7 @@ target-version = "py311"
 select = ["F", "B", "PLE"]
 # B905: zip(..., strict=) would be noise here; the zipped sequences are built together.
 ignore = ["B905"]
+
+[tool.bandit]
+# B311: `random` is used only to generate demo and load-test traffic, never for anything secret.
+skips = ["B311"]

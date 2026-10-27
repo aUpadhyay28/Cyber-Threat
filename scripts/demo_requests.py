@@ -21,7 +21,7 @@ D = (datetime.now(timezone.utc) - timedelta(days=8)).replace(hour=0, minute=0, s
 
 def get(path):
     req = urllib.request.Request(a.url + path, headers={"X-API-Key": a.key})
-    return json.load(urllib.request.urlopen(req))
+    return json.load(urllib.request.urlopen(req))  # nosec B310
 
 
 health = get("/health")
@@ -36,12 +36,12 @@ if health.get("timestamp_source") == "server":
 def post(body):
     req = urllib.request.Request(a.url + "/v1/score", json.dumps(body).encode(),
                                  {"Content-Type": "application/json", "X-API-Key": a.key})
-    return json.load(urllib.request.urlopen(req))
+    return json.load(urllib.request.urlopen(req))  # nosec B310
 
 
 def confirm(event_id):                      # the user passed the OTP -> login joins their normal profile
     req = urllib.request.Request(f"{a.url}/v1/confirm/{event_id}", b"", {"X-API-Key": a.key}, method="POST")
-    return json.load(urllib.request.urlopen(req))
+    return json.load(urllib.request.urlopen(req))  # nosec B310
 
 
 def login(user, when, ip, country, asn, browser, os_, device, ok=True, rtt=80):
