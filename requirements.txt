@@ -15,7 +15,7 @@ pytest>=8.0,<10
 # Server-side geo-IP (riskengine/geoip.py). Imported lazily, so the project runs without it as long
 # as RISK_GEOIP_MODE stays "client" - but that means the caller chooses its own country, so install
 # it and use "maxmind" anywhere real.
-geoip2>=4.7,<6
+geoip2>=5.3.0,<6
 # Shared state across workers (riskengine/redis_state.py). Optional: without RISK_REDIS_URL the
 # service keeps its state in-process, which is correct for a single worker.
 redis>=5.0,<7
