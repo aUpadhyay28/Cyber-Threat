@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.15-slim
 
 # Run as a normal user: a container that only scores logins has no reason to be root, and the risk
 # service holds the credential-stuffing history for every account on the site.
